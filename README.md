@@ -116,9 +116,8 @@ pip install paddlepaddle paddleocr rank_bm25 pymupdf streamlit-agraph python-dot
 
 ---
 
-### 4. 使用指南 (Markdown)
 
-```markdown
+```
 ## 💡 系统使用指南 (User Guide)
 
 启动系统后（`streamlit run app.py`），请按照以下流程操作：
