@@ -53,7 +53,7 @@ PDF_RAG_Project/
     │   └── reranker.py     # 重排序模型加载
     └── evaluation/
         └── evaluator.py    # AI 质量评估模块
-
+```
 ---
 
 ## 🛠️ 安装与运行 (Installation & Setup)
@@ -69,7 +69,7 @@ conda create -n pdf_rag python=3.9
 
 # 激活环境
 conda activate pdf_rag
-
+```
 ## 🚀 快速启动 (Quick Start)
 
 ### 1. 获取代码
@@ -79,7 +79,7 @@ git clone [https://github.com/你的用户名/你的仓库名.git](https://githu
 
 # 进入项目目录
 cd PDF_RAG_Project
-
+```
 
 ### 2. 安装依赖 (Install Dependencies)
 
@@ -95,7 +95,7 @@ pip install -r requirements.txt
 # 3. ⚠️ 手动安装核心组件
 # 某些库可能不在 requirements.txt 中，或者需要特定安装顺序，请务必执行：
 pip install paddlepaddle paddleocr rank_bm25 pymupdf streamlit-agraph python-dotenv
-
+```
 
 ### 3. 配置密钥 (API Key Configuration)
 
@@ -122,7 +122,7 @@ pip install paddlepaddle paddleocr rank_bm25 pymupdf streamlit-agraph python-dot
 ## 💡 系统使用指南 (User Guide)
 
 启动系统后（`streamlit run app.py`），请按照以下流程操作：
-
+```
 ### 第一步：文档加载与解析
 1.  在左侧 **“📂 文档管理”** 侧边栏，点击 **“Browse files”** 上传本地 PDF 文件。
 2.  上传成功后，点击下方的 **“🚀 开始智能解析”** 按钮。
