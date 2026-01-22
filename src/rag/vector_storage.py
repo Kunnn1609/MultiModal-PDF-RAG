@@ -1,118 +1,117 @@
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_community.retrievers import BM25Retriever
-
 import os
-import pickle
+import shutil
+import time
+import contextlib
+from langchain.schema import Document 
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
 
-# 1. 初始化中文 Embedding 模型 (推荐使用 BGE 或 m3e)
-# 该模型将文字转为向量数字，是检索的基础
-# db_path = r"D:\workspace\finale_workspace\PDF_RAG_Project\data\chroma_db"
+@contextlib.contextmanager
+def temporary_chdir(path):
+    """
+    上下文管理器：临时切换工作目录
+    用于解决 FAISS C++ 层无法处理中文绝对路径的 Bug
+    """
+    old_cwd = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(old_cwd)
 
-def build_vector_db(full_content, file_name, embedding_model, base_db_path=r"D:\workspace\finale_workspace\PDF_RAG_Project\data\vector_dbs"):
+def build_vector_db(docs, db_name, embedding_model):
     """
-    为每个文件创建独立的向量库文件夹
+    使用 FAISS 构建向量索引 (修复：正确读取 smart_parser 的元数据)
     """
-    # 1. 移除非法字符
-    safe_name = file_name.replace(".pdf", "").replace(" ", "_")
-    # 2. 确定最终存放路径
-    save_path = os.path.join(base_db_path, safe_name)
+    base_path = r"D:\workspace\finale_workspace\PDF_RAG_Project\data\vector_dbs"
+    target_dir = os.path.join(base_path, db_name)
     
-    # 如果该文件的库已经存在，可以选择跳过或重新覆盖
-    if os.path.exists(save_path):
-        print(f"ℹ️ 文件 {file_name} 的知识库已存在，将直接复用。")
-        # 如果你想强制覆盖，可以在这里用 shutil.rmtree(save_path)
-        return save_path
-
-    """
-    将解析出的内容切片并存入向量库
-    full_content: 之前 smart_extract 返回的页面字典列表
-    """
+    # --- 1. 数据清洗与元数据提取 ---
+    doc_objects = []
     
-    # 2. 配置切片器：控制块大小在 500 字左右，重叠 50 字
+    for i, d in enumerate(docs):
+        content = ""
+        meta = {}
+        
+        if isinstance(d, dict):
+            # 1. 提取内容
+            content = d.get("page_content") or d.get("text") or d.get("content") or ""
+            
+            # 2. 提取元数据 (核心修复)
+            # smart_parser 返回的是扁平字典，我们需要把非 content 的字段都放入 meta
+            # 优先检查是否存在显式的 'page_number' (来自 parser)
+            if "page_number" in d:
+                meta["source_page"] = d["page_number"]
+            if "method" in d:
+                meta["method"] = d["method"]
+                
+            # 兼容其他格式：如果真有 metadata 键，也合并进来
+            if "metadata" in d:
+                meta.update(d["metadata"])
+                
+        else:
+            # 兼容 Document 对象
+            content = getattr(d, "page_content", "")
+            meta = getattr(d, "metadata", {})
+
+        # 3. 兜底逻辑：如果经过上述步骤还是没有页码，使用 i+1
+        if "source_page" not in meta:
+            meta["source_page"] = i + 1
+
+        content = str(content)
+        if not content or not content.strip():
+            continue
+            
+        doc_objects.append(Document(page_content=content, metadata=meta))
+
+    if not doc_objects:
+        print("⚠️ [RAG] 警告：没有有效文档。")
+        return None
+    
+    # --- 2. 清理旧数据 ---
+    if os.path.exists(target_dir):
+        try:
+            shutil.rmtree(target_dir)
+            print(f"🧹 旧索引已清理: {target_dir}")
+        except Exception as e:
+            print(f"⚠️ 清理旧文件失败: {e}")
+
+    # --- 3. 切分文档 ---
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
-        length_function=len
+        chunk_size=500, 
+        chunk_overlap=50
     )
+    split_docs = text_splitter.split_documents(doc_objects)
+    
+    print(f"📄 文档切分完成: {len(doc_objects)} 页 -> {len(split_docs)} 个切片")
+    
+    # [Debug] 打印检查
+    if len(split_docs) > 0:
+        print(f"🐛 [Debug Check] 第一块元数据: {split_docs[0].metadata}")
+        if len(split_docs) > 5:
+            print(f"🐛 [Debug Check] 第五块元数据: {split_docs[5].metadata}")
 
-    documents = []
-    metadatas = []
-
-    # 3. 遍历每一页，生成带页码元数据的切片
-    for page in full_content:
-        page_text = page['content']
-        page_num = page['page_number']
-        chunks = text_splitter.split_text(page_text)
+    # --- 4. 构建并保存 FAISS 索引 ---
+    try:
+        print("🚀 正在构建 FAISS 内存索引...")
+        vectorstore = FAISS.from_documents(
+            documents=split_docs, 
+            embedding=embedding_model
+        )
         
-        for chunk in chunks:
-            documents.append(chunk)
-            # 这里的 metadata 是后续解决幻觉、定位页码的唯一依据
-            metadatas.append({
-                "source_page": page_num,
-                "extraction_method": page['method']
-            })
-
-    # 4. 创建并持久化向量库
-    print(f"📦 正在构建向量库，当前共有 {len(documents)} 个知识切片...")
-    vectordb = Chroma.from_texts(
-        texts=documents,
-        embedding=embedding_model,
-        metadatas=metadatas,
-        persist_directory=save_path
-    )
-    
-    # 5. 【核心优化】构建并保存 BM25 检索器所需的数据
-    # BM25 不像 Chroma 能自动持久化，我们需要手动保存文档列表
-    print(f"🧬 正在生成关键词索引 (BM25)...")
-    bm25_data = {
-        "documents": documents,
-        "metadatas": metadatas
-    }
-    with open(os.path.join(save_path, "bm25_data.pkl"), "wb") as f:
-        pickle.dump(bm25_data, f)
-
-    print(f"✅ 混合索引构建成功！路径: {save_path}")
-    return vectordb
-
-if __name__ == "__main__":
-    # --- 全链路测试 (因为函数改了，这里测试代码也要改) ---
-    import sys
-    from langchain_community.embeddings import HuggingFaceEmbeddings # 仅测试时导入
-    
-    # 添加 src 目录到路径
-    src_dir = os.path.join(os.path.dirname(__file__), '..')
-    src_dir = os.path.abspath(src_dir)
-    if src_dir not in sys.path:
-        sys.path.insert(0, src_dir)
-    
-    from parser.smart_parser import smart_extract
-    from paddleocr import PaddleOCR
-    
-    # 1. 初始化模型 (这是模拟 app.py 的行为)
-    print("⏳ 测试模式：正在初始化 Embedding 模型...")
-    test_embedding_model = HuggingFaceEmbeddings(model_name="shibing624/text2vec-base-chinese")
-    
-    # 2. 模拟解析
-    engine = PaddleOCR(lang="ch", use_angle_cls=True)
-    # 替换为你本地真实存在的 PDF 路径
-    test_pdf = r"D:\workspace\finale_workspace\PDF_RAG_Project\data\raw\test.pdf" 
-    
-    if os.path.exists(test_pdf):
-        print("🔍 开始解析 PDF...")
-        pages_data = smart_extract(test_pdf, engine)
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir)
         
-        # 3. 存入数据库 (传入模型)
-        print("💾 开始建库...")
-        # 注意：这里传入了 test_embedding_model
-        db = build_vector_db(pages_data, "test.pdf", test_embedding_model)
+        print(f"💾 正在保存索引到: {target_dir}")
+        with temporary_chdir(target_dir):
+            vectorstore.save_local(".")
+            
+        print(f"✅ [RAG] FAISS 索引保存成功！")
         
-        if db:
-            # 4. 验证检索功能
-            query = "测试提问"
-            print(f"\n🔍 测试检索提问: {query}")
-            results = db.similarity_search(query, k=2)
-            for doc in results:
-                print(f"[P{doc.metadata['source_page']}] {doc.page_content[:50]}...")
-    else:
-        print(f"❌ 测试文件不存在: {test_pdf}")
+    except Exception as e:
+        print(f"❌ [RAG] 索引构建失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+        
+    return target_dir

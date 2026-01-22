@@ -1,253 +1,243 @@
-import sys
-import os
-
-# 1. 环境与路径处理
-os.environ["PYTHONNOUSERSITE"] = "1"
-sys.path = [p for p in sys.path if "AppData" not in p]
-project_root = os.path.dirname(os.path.abspath(__file__))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
 import streamlit as st
-# 必须先安装: pip install pymupdf
-import fitz  # PyMuPDF
-from PIL import Image
-
-st.set_page_config(page_title="智能PDF多模态问答系统", page_icon="📚", layout="wide")
-
+import os
 import shutil
-import json
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from src.parser.smart_parser import smart_extract, PaddleOCR
+import time
+import fitz  # PyMuPDF
+from langchain_community.embeddings import DashScopeEmbeddings
+from paddleocr import PaddleOCR
+from dotenv import load_dotenv
+
+# 引入后端模块
+from src.parser.smart_parser import smart_extract
 from src.rag.vector_storage import build_vector_db
 from src.llm.rag_chain import get_answer_stream
-from src.evaluation.evaluator import evaluate_response
-from src.llm.graph_agent import extract_triplets_from_text, build_graph_config
-from src.rag.reranker import get_reranker
-from streamlit_agraph import agraph
 
-# 预加载模型
+st.set_page_config(page_title="智能文档专家 (Ultimate)", page_icon="⚡", layout="wide")
+load_dotenv()
+
+RAW_DATA_DIR = os.path.join("data", "raw")
+DB_DATA_DIR = os.path.join("data", "vector_dbs")
+os.makedirs(RAW_DATA_DIR, exist_ok=True)
+os.makedirs(DB_DATA_DIR, exist_ok=True)
+
+if 'uploader_key' not in st.session_state: st.session_state.uploader_key = 0
+
 @st.cache_resource
-def load_models():
-    print("⏳ [系统] 正在初始化 Embedding 模型...")
-    embeddings = HuggingFaceEmbeddings(model_name="shibing624/text2vec-base-chinese")
+def load_ocr_engine():
+    return PaddleOCR(use_angle_cls=True, lang="ch")
+
+def render_pdf_page_as_image(pdf_path, human_page_num):
+    if not os.path.exists(pdf_path): return None
     try:
-        get_reranker()
-    except:
-        pass
-    return embeddings
+        doc = fitz.open(pdf_path)
+        try: page_index = int(human_page_num) - 1 
+        except: page_index = 0
+        if page_index < 0: page_index = 0
+        if page_index >= len(doc): page_index = len(doc) - 1
+        page = doc.load_page(page_index)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        return pix.tobytes()
+    except: return None
 
-with st.spinner("正在启动智能分析引擎..."):
-    global_embed_model = load_models()
+def delete_project_completely(clean_filename):
+    pdf_path = os.path.join(RAW_DATA_DIR, f"{clean_filename}.pdf")
+    db_path = os.path.join(DB_DATA_DIR, clean_filename)
+    if 'current_db' in st.session_state and st.session_state['current_db'] == db_path:
+        del st.session_state['current_db']
+    if 'last_selected' in st.session_state and st.session_state['last_selected'] == f"{clean_filename}.pdf":
+        del st.session_state['last_selected']
+    if os.path.exists(db_path):
+        try: shutil.rmtree(db_path)
+        except: return False
+    if os.path.exists(pdf_path):
+        try: os.remove(pdf_path)
+        except: return False
+    return True
 
-# 侧边栏逻辑
-with st.sidebar:
-    st.header("📂 文档管理")
-    with st.expander("🛠️ 系统诊断"):
-        st.write(f"**Python:** {sys.executable}")
+# --- 🔥 核心修复：针对中文优化的评分算法 ---
 
-    st.divider()
-    DB_BASE_PATH = r"D:\workspace\finale_workspace\PDF_RAG_Project\data\vector_dbs"
-    RAW_DATA_PATH = r"D:\workspace\finale_workspace\PDF_RAG_Project\data\raw"
-    os.makedirs(DB_BASE_PATH, exist_ok=True)
-    os.makedirs(RAW_DATA_PATH, exist_ok=True)
+def calculate_metrics(question, answer, source_docs):
+    """
+    使用字符级 (Character-level) Jaccard 相似度来评估中文质量
+    """
+    # 1. 预处理：将文本打散成字符集合 (解决中文没有空格的问题)
+    # 例如：set("你好") -> {'你', '好'}
+    context_text = "".join([d.page_content for d in source_docs])
     
-    uploaded_file = st.file_uploader("上传 PDF 文档", type="pdf")
-
-    @st.cache_resource
-    def init_ocr():
-        return PaddleOCR(lang="ch", use_angle_cls=True)
-    ocr_engine = init_ocr()
+    # 过滤掉标点和特殊符号，只比对有意义的字符
+    ignore_chars = set(" ，。！？、\n\t*`")
     
-    if uploaded_file:
-        # --- 核心修改：强制标准化文件名 ---
-        # 1. 把文件名里的空格强制换成下划线，防止路径匹配错误
-        clean_filename = uploaded_file.name.replace(" ", "_")
-        
-        # 2. 确定 PDF 存储路径 (存下去的就是标准化的名字)
-        file_path = os.path.join(RAW_DATA_PATH, clean_filename)
-        
-        # 3. 确定数据库名称 (去掉 .pdf 后缀)
-        # 这样 PDF 文件名 = "My_File.pdf"，数据库名 = "My_File"，完全对应
-        db_name = clean_filename.replace(".pdf", "")
-        target_db_path = os.path.join(DB_BASE_PATH, db_name)
-
-        # 保存文件
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        
-        if st.button("🚀 开始智能解析"):
-            with st.status("正在处理文档...", expanded=True) as status:
-                st.write("🔍 OCR 文本/图表识别...")
-                pages_data = smart_extract(file_path, ocr_engine)
-                st.write("🧠 建立语义索引...")
-                # 注意：这里传入 clean_filename，确保后续逻辑一致
-                build_vector_db(pages_data, clean_filename, embedding_model=global_embed_model)
-                status.update(label="✅ 入库完成", state="complete")
-            st.rerun()
-
-    st.divider()
-    existing_dbs = [d for d in os.listdir(DB_BASE_PATH) if os.path.isdir(os.path.join(DB_BASE_PATH, d))]
+    ans_chars = set(answer) - ignore_chars
+    ctx_chars = set(context_text) - ignore_chars
+    q_chars = set(question) - ignore_chars
     
-    # 全局变量：当前选中的知识库名称
-    selected_db_name = None 
-    
-    if existing_dbs:
-        selected_db_name = st.selectbox("选择知识库：", existing_dbs)
-        current_db_path = os.path.join(DB_BASE_PATH, selected_db_name)
-        if st.button("🗑️ 删除"):
-            shutil.rmtree(current_db_path)
-            st.rerun()
+    if not ans_chars: 
+        return {"faithfulness": 0.0, "relevance": 0.0, "evidence": 0.0}
+
+    # 2. 忠实度 (Faithfulness)
+    # 计算：回答里的字，有多少是原文里有的？
+    # 惩罚项：如果回答里大量出现原文没有的字（幻觉），分数会低
+    overlap_chars = ans_chars.intersection(ctx_chars)
+    faithfulness = len(overlap_chars) / len(ans_chars)
+
+    # 3. 相关性 (Relevance)
+    # 计算：问题里的字，有多少在回答里出现了？
+    # 这是一个启发式算法。因为回答通常会包含问题的主语和关键词。
+    if not q_chars:
+        relevance = 0.0
     else:
-        st.warning("暂无知识库")
-        current_db_path = None
+        q_overlap = ans_chars.intersection(q_chars)
+        # 乘个系数 2.0，因为回答不需要包含问题的所有字（比如疑问词）
+        relevance = min((len(q_overlap) / len(q_chars)) * 2.0, 1.0)
 
-# 主界面
-st.title("🤖 PDF 智能问答系统")
-st.caption("🚀 支持多模态解析 · 混合检索 · 原文截图 · 知识图谱")
-st.divider()
+    # 4. 证据度 (Evidence)
+    evidence_score = min(len(source_docs) / 4, 1.0)
 
-if "messages" not in st.session_state: st.session_state.messages = []
-if "latest_qa_pair" not in st.session_state: st.session_state.latest_qa_pair = None
+    return {
+        "faithfulness": faithfulness,
+        "relevance": relevance,
+        "evidence": evidence_score
+    }
 
-# --- 核心：渲染历史消息 (含 PDF 截图) ---
-for i, msg in enumerate(st.session_state.messages):
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+def generate_expert_critique(metrics):
+    """
+    根据调整后的阈值生成评语
+    """
+    critiques = []
+    
+    # 忠实度：字符级匹配通常比较高，阈值设为 0.6
+    f = metrics['faithfulness']
+    if f > 0.85: critiques.append("✅ **可信度极高**：回答严格基于原文。")
+    elif f > 0.6: critiques.append("⚠️ **可信度一般**：包含部分总结性措辞。")
+    else: critiques.append("🚫 **存在幻觉风险**：大量用词未在原文出现，请核对。")
+    
+    # 相关性：阈值设低一点，因为中文表达灵活
+    r = metrics['relevance']
+    if r > 0.6: critiques.append("🎯 **切题精准**：紧扣问题核心。")
+    elif r > 0.3: critiques.append("👌 **基本切题**：回答了主要方面。")
+    else: critiques.append("🤔 **答非所问**：未包含问题关键词。")
+    
+    e = metrics['evidence']
+    if e >= 0.75: critiques.append("📚 **引用丰富**：论证扎实。")
+    else: critiques.append("🔍 **资料较少**：仅检索到少量片段。")
+    
+    return "\n\n".join(critiques)
+
+# ================= 侧边栏 =================
+with st.sidebar:
+    st.header("📚 FAISS 书架")
+    uploaded_file = st.file_uploader("➕ 上传", type=["pdf"], key=f"uploader_{st.session_state.uploader_key}")
+    if uploaded_file:
+        file_name = uploaded_file.name
+        save_path = os.path.join(RAW_DATA_DIR, file_name)
+        if not os.path.exists(save_path):
+            with open(save_path, "wb") as f: f.write(uploaded_file.getbuffer())
+            st.toast(f"✅ {file_name} 入库")
+            st.session_state.uploader_key += 1
+            time.sleep(0.5)
+            st.rerun()
+    
+    st.divider()
+    local_files = [f for f in os.listdir(RAW_DATA_DIR) if f.lower().endswith('.pdf')]
+    if local_files:
+        idx = 0
+        if 'last_selected' in st.session_state and st.session_state['last_selected'] in local_files:
+            idx = local_files.index(st.session_state['last_selected'])
+        selected_file = st.selectbox("📂 选择文档", local_files, index=idx)
+        st.session_state['last_selected'] = selected_file
         
-        if msg["role"] == "assistant":
-            # 1. 来源文档 + PDF 截图
-            if "source_docs" in msg and msg["source_docs"]:
-                with st.expander("📖 参考来源 & 原文截图"):
-                    docs = msg["source_docs"]
-                    # 使用 Tabs 切换不同来源
-                    tabs = st.tabs([f"📄 P{d.metadata.get('source_page', '?')}" for d in docs[:3]])
-                    
-                    for idx, tab in enumerate(tabs):
-                        with tab:
-                            doc = docs[idx]
-                            c1, c2 = st.columns([1, 1])
-                            
-                            # 左侧：文字内容
-                            with c1:
-                                st.caption("🔍 提取文本")
-                                st.info(f"{doc.page_content}...")
-                            
-                            # 右侧：PDF 截图 (绝活功能)
-                            with c2:
-                                try:
-                                    if selected_db_name:
-                                        # --- 核心修改：直接拼接，无需猜测 ---
-                                        # 因为我们在上传时已经强制统一了命名规则：
-                                        # 数据库名 "My_File" -> 对应的 PDF 一定是 "My_File.pdf"
-                                        pdf_name = selected_db_name + ".pdf"
-                                        pdf_file_path = os.path.join(RAW_DATA_PATH, pdf_name)
-                                        
-                                        if os.path.exists(pdf_file_path):
-                                            # 注意：source_page 有时候可能是 string，安全转 int
-                                            page_num = int(doc.metadata.get('source_page', 1)) - 1
-                                            
-                                            with fitz.open(pdf_file_path) as pdf:
-                                                # 安全检查页码范围
-                                                if 0 <= page_num < len(pdf):
-                                                    page = pdf[page_num]
-                                                    # 缩放系数 2 表示 2 倍清晰度
-                                                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                                                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                                                    st.image(img, caption=f"📸 原文 P{page_num+1} 截图", use_column_width=True)
-                                                else:
-                                                    st.warning(f"页码 {page_num+1} 超出文档范围")
-                                        else:
-                                            # 如果找不到，打印一下路径方便调试
-                                            st.warning(f"未找到源文件: {pdf_name}")
-                                            st.caption(f"请确认 {RAW_DATA_PATH} 目录下是否存在该文件")
-                                except Exception as e:
-                                    st.error(f"截图加载失败: {e}")
+        if selected_file:
+            clean_name = os.path.splitext(selected_file)[0].strip()
+            pdf_path = os.path.join(RAW_DATA_DIR, selected_file)
+            db_path = os.path.join(DB_DATA_DIR, clean_name)
+            st.session_state['current_pdf_path'] = pdf_path
+            st.session_state['current_db'] = db_path
+            
+            if os.path.exists(os.path.join(db_path, "index.faiss")):
+                st.success("✅ 已解析")
+                if st.button("🗑️ 删除"):
+                    if delete_project_completely(clean_name):
+                        st.rerun()
+            else:
+                st.warning("⚠️ 未解析")
+                if st.button("🚀 解析"):
+                    with st.spinner("解析中..."):
+                        try:
+                            ocr = load_ocr_engine()
+                            embed = DashScopeEmbeddings(model="text-embedding-v1")
+                            raw = smart_extract(pdf_path, ocr)
+                            build_vector_db(raw, clean_name, embed)
+                            st.success("完成")
+                            st.rerun()
+                        except Exception as e: st.error(str(e))
 
-# 输入处理
-if prompt := st.chat_input("请输入关于文档的问题..."):
-    if not current_db_path:
-        st.error("请先上传或选择一个文档！")
+# ================= 主界面 =================
+st.title("⚡ 智能文档专家 (FAISS Pro)")
+
+if 'messages' not in st.session_state: st.session_state.messages = []
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]): st.markdown(msg["content"])
+
+if prompt := st.chat_input("提问..."):
+    current_db = st.session_state.get('current_db')
+    current_pdf = st.session_state.get('current_pdf_path')
+    
+    if not current_db or not os.path.exists(os.path.join(current_db, "index.faiss")):
+        st.toast("❌ 请先解析文档")
         st.stop()
 
-    # 用户消息上屏
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    with st.chat_message("user"): st.markdown(prompt)
 
-    # 助手回复
     with st.chat_message("assistant"):
-        msg_placeholder = st.empty()
+        placeholder = st.empty()
         full_response = ""
+        embed = DashScopeEmbeddings(model="text-embedding-v1")
         
-        responses, source_docs = get_answer_stream(
-            prompt, 
-            current_db_path, 
-            st.session_state.messages,
-            embedding_model=global_embed_model
-        )
-        
-        for response in responses:
-            if response.status_code == 200:
-                chunk = response.output.choices[0].message.content
-                full_response += chunk
-                msg_placeholder.markdown(full_response + "▌")
-        
-        msg_placeholder.markdown(full_response)
+        try:
+            response_stream, source_docs = get_answer_stream(prompt, current_db, st.session_state.messages, embed)
+            
+            for chunk in response_stream:
+                if chunk.status_code == 200:
+                    content = chunk.output.choices[0].message.content
+                    full_response += content
+                    placeholder.markdown(full_response + "▌")
+            placeholder.markdown(full_response)
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-        # 构建上下文
-        context_str = "\n\n".join([f"[P{d.metadata.get('source_page')}] {d.page_content}" for d in source_docs])
-        
-        # 生成图谱
-        current_graph = None
-        with st.spinner("正在分析实体关系..."):
-            triplets = extract_triplets_from_text(context_str)
-            if triplets:
-                nodes, edges, config = build_graph_config(triplets)
-                current_graph = {"nodes": nodes, "edges": edges, "config": config}
-            else:
-                current_graph = "empty"
-
-        # 打包存入历史
-        st.session_state.messages.append({
-            "role": "assistant", 
-            "content": full_response,
-            "source_docs": source_docs,
-            "graph_data": current_graph
-        })
-
-        # 保存最新数据用于下方展示
-        st.session_state.latest_qa_pair = {
-            "query": prompt,
-            "context": context_str,
-            "response": full_response,
-            "graph": current_graph
-        }
-        
-        st.rerun()
-
-# --- 底部功能区 (只针对最新一条) ---
-if st.session_state.latest_qa_pair:
-    latest_data = st.session_state.latest_qa_pair
-    
-    # 1. 知识图谱 (只显示最新的，避免 key 报错)
-    graph = latest_data.get("graph")
-    if graph and graph != "empty":
-        st.divider()
-        st.subheader("🕸️ 当前思维图谱")
-        agraph(nodes=graph["nodes"], edges=graph["edges"], config=graph["config"])
-
-    # 2. 质量评估
-    st.divider()
-    with st.expander("📊 质量评估 (针对最新问答)"):
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            if st.button("✨ 评分"):
-                with st.spinner("评估中..."):
-                    raw = evaluate_response(latest_data["query"], latest_data["context"], latest_data["response"])
-                    try:
-                        res = json.loads(raw.replace("```json", "").replace("```", "").strip())
-                        st.info(f"忠实度: {res.get('faithfulness')}/10 | 相关性: {res.get('relevance')}/10")
-                        st.caption(res.get('reason'))
-                    except:
-                        st.write(raw)
+            if source_docs:
+                unique_pages = sorted(list(set(
+                    [doc.metadata.get('human_page_number', 1) for doc in source_docs]
+                )))
+                
+                st.divider()
+                st.markdown(f"**📚 引用来源 ({len(unique_pages)} 页)**")
+                
+                for page_num in unique_pages:
+                    with st.expander(f"📄 第 {page_num} 页原文快照", expanded=True):
+                        relevant_text = next((d.page_content for d in source_docs if d.metadata.get('human_page_number') == page_num), "...")
+                        st.caption(f"相关内容摘录: ...{relevant_text[:100]}...")
+                        if current_pdf and os.path.exists(current_pdf):
+                            img_bytes = render_pdf_page_as_image(current_pdf, page_num)
+                            if img_bytes: st.image(img_bytes, use_column_width=True)
+            
+            # 计算指标
+            scores = calculate_metrics(prompt, full_response, source_docs)
+            
+            # --- 仪表盘展示 ---
+            st.divider()
+            st.subheader("📊 质量评估")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("🛡️ 忠实度", f"{scores['faithfulness']*100:.0f}%")
+            c1.progress(scores['faithfulness'])
+            c2.metric("🎯 相关性", f"{scores['relevance']*100:.0f}%")
+            c2.progress(scores['relevance'])
+            c3.metric("📚 引用数", len(source_docs))
+            c3.progress(scores['evidence'])
+            
+            st.info(f"**🧑‍🏫 专家点评：**\n\n{generate_expert_critique(scores)}")
+            
+        except Exception as e:
+            st.error(f"Error: {e}")
+            import traceback
+            st.code(traceback.format_exc())
