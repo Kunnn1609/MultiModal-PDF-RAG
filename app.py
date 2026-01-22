@@ -35,7 +35,9 @@ def render_pdf_page_as_image(pdf_path, human_page_num):
         if page_index < 0: page_index = 0
         if page_index >= len(doc): page_index = len(doc) - 1
         page = doc.load_page(page_index)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        
+        # 🎨 【优化 1】降低渲染倍率：1.5倍足够清晰，且图片更小更轻量
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5)) 
         return pix.tobytes()
     except: return None
 
@@ -60,13 +62,8 @@ def calculate_metrics(question, answer, source_docs):
     """
     使用字符级 (Character-level) Jaccard 相似度来评估中文质量
     """
-    # 1. 预处理：将文本打散成字符集合 (解决中文没有空格的问题)
-    # 例如：set("你好") -> {'你', '好'}
     context_text = "".join([d.page_content for d in source_docs])
-    
-    # 过滤掉标点和特殊符号，只比对有意义的字符
     ignore_chars = set(" ，。！？、\n\t*`")
-    
     ans_chars = set(answer) - ignore_chars
     ctx_chars = set(context_text) - ignore_chars
     q_chars = set(question) - ignore_chars
@@ -74,23 +71,15 @@ def calculate_metrics(question, answer, source_docs):
     if not ans_chars: 
         return {"faithfulness": 0.0, "relevance": 0.0, "evidence": 0.0}
 
-    # 2. 忠实度 (Faithfulness)
-    # 计算：回答里的字，有多少是原文里有的？
-    # 惩罚项：如果回答里大量出现原文没有的字（幻觉），分数会低
     overlap_chars = ans_chars.intersection(ctx_chars)
     faithfulness = len(overlap_chars) / len(ans_chars)
 
-    # 3. 相关性 (Relevance)
-    # 计算：问题里的字，有多少在回答里出现了？
-    # 这是一个启发式算法。因为回答通常会包含问题的主语和关键词。
     if not q_chars:
         relevance = 0.0
     else:
         q_overlap = ans_chars.intersection(q_chars)
-        # 乘个系数 2.0，因为回答不需要包含问题的所有字（比如疑问词）
         relevance = min((len(q_overlap) / len(q_chars)) * 2.0, 1.0)
 
-    # 4. 证据度 (Evidence)
     evidence_score = min(len(source_docs) / 4, 1.0)
 
     return {
@@ -100,18 +89,12 @@ def calculate_metrics(question, answer, source_docs):
     }
 
 def generate_expert_critique(metrics):
-    """
-    根据调整后的阈值生成评语
-    """
     critiques = []
-    
-    # 忠实度：字符级匹配通常比较高，阈值设为 0.6
     f = metrics['faithfulness']
     if f > 0.85: critiques.append("✅ **可信度极高**：回答严格基于原文。")
     elif f > 0.6: critiques.append("⚠️ **可信度一般**：包含部分总结性措辞。")
     else: critiques.append("🚫 **存在幻觉风险**：大量用词未在原文出现，请核对。")
     
-    # 相关性：阈值设低一点，因为中文表达灵活
     r = metrics['relevance']
     if r > 0.6: critiques.append("🎯 **切题精准**：紧扣问题核心。")
     elif r > 0.3: critiques.append("👌 **基本切题**：回答了主要方面。")
@@ -126,6 +109,13 @@ def generate_expert_critique(metrics):
 # ================= 侧边栏 =================
 with st.sidebar:
     st.header("📚 FAISS 书架")
+    
+    # 🛑 【优化 2】添加“中止生成”按钮 (新增内容)
+    if st.button("⏹️ 中止/重置", type="primary"):
+        st.rerun()
+        
+    st.divider()
+    
     uploaded_file = st.file_uploader("➕ 上传", type=["pdf"], key=f"uploader_{st.session_state.uploader_key}")
     if uploaded_file:
         file_name = uploaded_file.name
@@ -172,7 +162,7 @@ with st.sidebar:
                         except Exception as e: st.error(str(e))
 
 # ================= 主界面 =================
-st.title("⚡ 智能文档专家 (FAISS Pro)")
+st.title("⚡ PDF智能文档专家")
 
 if 'messages' not in st.session_state: st.session_state.messages = []
 for msg in st.session_state.messages:
@@ -213,13 +203,19 @@ if prompt := st.chat_input("提问..."):
                 st.divider()
                 st.markdown(f"**📚 引用来源 ({len(unique_pages)} 页)**")
                 
-                for page_num in unique_pages:
-                    with st.expander(f"📄 第 {page_num} 页原文快照", expanded=True):
-                        relevant_text = next((d.page_content for d in source_docs if d.metadata.get('human_page_number') == page_num), "...")
-                        st.caption(f"相关内容摘录: ...{relevant_text[:100]}...")
-                        if current_pdf and os.path.exists(current_pdf):
-                            img_bytes = render_pdf_page_as_image(current_pdf, page_num)
-                            if img_bytes: st.image(img_bytes, use_column_width=True)
+                # 🎨 【优化 3】改为双列布局 (修改部分)
+                cols = st.columns(2)
+                
+                for idx, page_num in enumerate(unique_pages):
+                    # 将图片分配到左右两列
+                    with cols[idx % 2]:
+                        with st.expander(f"📄 第 {page_num} 页原文快照", expanded=True):
+                            relevant_text = next((d.page_content for d in source_docs if d.metadata.get('human_page_number') == page_num), "...")
+                            st.caption(f"相关内容摘录: ...{relevant_text[:100]}...")
+                            if current_pdf and os.path.exists(current_pdf):
+                                img_bytes = render_pdf_page_as_image(current_pdf, page_num)
+                                # use_column_width=True 配合 columns(2) 会自动缩小图片
+                                if img_bytes: st.image(img_bytes, use_column_width=True)
             
             # 计算指标
             scores = calculate_metrics(prompt, full_response, source_docs)

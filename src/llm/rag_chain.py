@@ -4,7 +4,7 @@ import contextlib
 from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 
-# --- 0. 辅助工具：中文路径补丁 ---
+# --- 0. 辅助工具 ---
 @contextlib.contextmanager
 def temporary_chdir(path):
     old_cwd = os.getcwd()
@@ -12,7 +12,7 @@ def temporary_chdir(path):
     try: yield
     finally: os.chdir(old_cwd)
 
-# --- 1. Rerank (重排序) ---
+# --- 1. Rerank ---
 try:
     from src.rag.reranker import get_reranker
     def rerank_documents(query, docs, top_k=3):
@@ -39,6 +39,7 @@ def rewrite_query(user_query, chat_history):
     history_text = "\n".join([f"{'用户' if m['role']=='user' else '助手'}: {m['content']}" for m in recent])
     prompt = f"任务：改写提问，补全指代词。\n历史：{history_text}\n提问：{user_query}\n结果："
     try:
+        # 改写不需要太严谨，temperature 保持默认即可
         res = dashscope.Generation.call(model='qwen-turbo', messages=[{'role':'user','content':prompt}], result_format='message')
         if res.status_code == 200: return res.output.choices[0].message.content.strip()
     except: pass
@@ -59,48 +60,40 @@ def get_answer_stream(query, db_path, chat_history=[], embedding_model=None):
     except:
         vectorstore = FAISS.load_local(db_path, embedding_model, allow_dangerous_deserialization=True)
 
-    # Step 3: 检索 (海量召回)
-    # 召回 20 条，确保覆盖全文主要内容
+    # Step 3: 检索
     retrieved_docs = vectorstore.similarity_search(search_query, k=20)
 
-    # Step 4: Rerank (精选)
-    # 选出最相关的 10 条给大模型
+    # Step 4: Rerank
     final_docs = rerank_documents(search_query, retrieved_docs, top_k=10)
     
-    # Step 5: 构建上下文 (🔥 关键：清洗页码，让 Prompt 看得懂)
-    # 我们先对文档进行排序，让页码从小到大，符合阅读逻辑
+    # Step 5: 构建上下文
     for doc in final_docs:
         raw_page = doc.metadata.get('source_page') or doc.metadata.get('page_number') or 1
         try:
             val = int(raw_page)
-            # 如果索引是0，变成1；如果是1，保持1。
-            # 这里的逻辑取决于你的 Parser 存的是 0-based 还是 1-based。
-            # 假设之前出现过偏差，这里我们统一确保最小是 1。
             doc.metadata['human_page_number'] = val if val > 0 else 1
         except:
             doc.metadata['human_page_number'] = 1
 
-    # 按页码排序
     final_docs.sort(key=lambda x: x.metadata['human_page_number'])
 
     context_list = []
     for doc in final_docs:
         p = doc.metadata['human_page_number']
-        # 这里的格式要非常清晰，让 AI 知道这一段话属于哪一页
         context_list.append(f"【第 {p} 页内容】:\n{doc.page_content}")
     
     context_str = "\n\n".join(context_list) if context_list else "未找到相关文档。"
 
-    # Step 6: Prompt (🔥 核心修改：强制引用格式)
-    system_prompt = f"""你是一个极其严谨的文档分析员。你必须完全基于下方的【参考资料】回答用户问题。
+    # Step 6: Prompt (🔥 优化重点：结构化思维链 Prompt)
+    system_prompt = f"""你是一个专业的深度阅读助手。请基于【参考资料】回答问题。
 
-### ⚠️ 核心原则 (必须遵守)：
-1.  **零外部知识**：你的大脑里只有下方的【参考资料】，忘掉你训练过的其他知识。如果资料里没提到的内容，直接说“资料未提及”。
-2.  **强制引用格式**：你的回答中，**每一句**事实陈述、数据引用或观点总结，都必须在该句结尾加上来源，格式严格为：`(来自第x页)`。
-    * ❌ 错误：根据文档，营收增长了。
-    * ✅ 正确：2023年营收增长了20%(来自第5页)。
-    * ✅ 正确：作者认为时间管理是骗局(来自第1页)，真正的关键是注意力管理(来自第2页)。
-3.  **页码对应**：参考资料中标记为【第 x 页内容】，你的引用就必须写 `(来自第x页)`，不要自己加减数字。
+### ⚠️ 回答规范 (必须严格遵守)：
+1.  **结构化输出**：请务必使用 **Markdown 列表 (Bullet Points)** 的形式来组织答案，不要写成一大段长文。
+2.  **细节优先**：不要只写宏观概念，要提取具体的**方法论、步骤、核心观点**。
+    * ❌ 差的回答：文章介绍了时间管理的方法。
+    * ✅ 好的回答：文章提出了 "5 AM Project"，建议利用早上5点的时间做最重要的事 (来自第2页)。
+3.  **强制引用**：每一条要点后必须标注 `(来自第x页)`。
+4.  **零外部知识**：严禁编造资料中没有的内容。
 
 ### 参考资料：
 {context_str}
@@ -111,12 +104,15 @@ def get_answer_stream(query, db_path, chat_history=[], embedding_model=None):
         {'role': 'user', 'content': query}
     ]
 
+    # 🔥 核心修改：添加 temperature 参数
     responses = dashscope.Generation.call(
-        model='qwen-turbo', # 或者 qwen-plus 效果更好
+        model='qwen-turbo',
         messages=messages,
         result_format='message',
         stream=True,
-        incremental_output=True
+        incremental_output=True,
+        temperature=0.01,  # 👈 关键！设为极低值，接近 0
+        top_p=0.8          # 辅助参数，限制过度发散
     )
     
     return responses, final_docs
